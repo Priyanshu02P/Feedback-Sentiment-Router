@@ -1,0 +1,20 @@
+Classify the following feedback.
+
+Feedback:
+{{feedback_text}}
+
+Return JSON using this schema:
+
+{
+"actionable": true,
+"summary": "",
+"labels": [
+{
+"category": "",
+"sub_category": "",
+"sentiment": "",
+"severity": "",
+"confidence": 0.0
+}
+]
+}

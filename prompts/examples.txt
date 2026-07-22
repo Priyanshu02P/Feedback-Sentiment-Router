@@ -1,0 +1,108 @@
+Example 1
+
+Input:
+
+The instructor explains concepts clearly and uses excellent examples.
+
+Output:
+
+{
+  "actionable": false,
+  "summary": "Positive feedback on teaching quality.",
+  "labels": [
+    {
+      "category": "Tutor",
+      "sub_category": "Delivery",
+      "sentiment": "Positive",
+      "severity": "Low",
+      "confidence": 0.98
+    }
+  ]
+}
+
+Example 2
+
+Input:
+
+Auto grader keeps giving zero even when answers are correct.
+
+Output:
+
+{
+  "actionable": true,
+  "summary": "Auto grader incorrectly scores correct answers.",
+  "labels": [
+    {
+      "category": "Tech",
+      "sub_category": "Assessment",
+      "sentiment": "Negative",
+      "severity": "High",
+      "confidence": 0.97
+    }
+  ]
+}
+
+Example 3
+
+Input:
+
+Tutor speaks too fast and some videos have poor audio.
+
+Output:
+
+{
+  "actionable": true,
+  "summary": "Tutor pace is too fast and audio quality is poor.",
+  "labels": [
+    {
+      "category": "Tutor",
+      "sub_category": "Pace",
+      "sentiment": "Negative",
+      "severity": "Medium",
+      "confidence": 0.93
+    },
+    {
+      "category": "Tech",
+      "sub_category": "Media",
+      "sentiment": "Negative",
+      "severity": "Medium",
+      "confidence": 0.92
+    }
+  ]
+}
+
+Example 4
+
+Input:
+
+I don't like Java. Python would have been better.
+
+Output:
+
+{
+  "actionable": false,
+  "summary": "Personal language preference.",
+  "labels": []
+}
+
+Example 5
+
+Input:
+
+Quiz questions cover topics that were never taught.
+
+Output:
+
+{
+  "actionable": true,
+  "summary": "Assessment content does not match course material.",
+  "labels": [
+    {
+      "category": "Assessment",
+      "sub_category": "Alignment",
+      "sentiment": "Negative",
+      "severity": "High",
+      "confidence": 0.96
+    }
+  ]
+}
