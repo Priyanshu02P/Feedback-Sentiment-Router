@@ -1,0 +1,241 @@
+{
+  "name": "Positive Feedback → Testimonials",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "6c90916e-3b80-49a1-8883-8dc842e2314e",
+      "name": "When clicking 'Test workflow'",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "conf-threshold",
+              "name": "confidence_threshold",
+              "type": "number",
+              "value": 0.7
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "34861bb4-ffbf-4e4b-bd5f-f2fb2d688b26",
+      "name": "Set Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        240,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  fl.feedback_id,\n  fl.course_id,\n  fl.sentiment,\n  fl.confidence,\n  f.raw_feedback\nFROM feedback_labels fl\nJOIN feedbacks f ON f.feedback_id = fl.feedback_id\nLEFT JOIN testimonials t ON t.feedback_id = fl.feedback_id\nWHERE fl.sentiment ILIKE 'positive'\n  AND fl.confidence >= {{$json.confidence_threshold}}\n  AND t.id IS NULL\nORDER BY fl.confidence DESC;",
+        "options": {}
+      },
+      "id": "80b2926a-6be1-4a01-8749-cf96bdb95e63",
+      "name": "Get New Positive Feedbacks",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        480,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "JapTUFH5W8ZdwD0T",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "map-feedback-id",
+              "name": "feedback_id",
+              "type": "string",
+              "value": "={{$json.feedback_id}}"
+            },
+            {
+              "id": "map-course-id",
+              "name": "course_id",
+              "type": "string",
+              "value": "={{$json.course_id}}"
+            },
+            {
+              "id": "map-quote",
+              "name": "quote",
+              "type": "string",
+              "value": "={{$json.feedback_text.length > 280 ? $json.feedback_text.slice(0, 277) + '...' : $json.feedback_text}}"
+            },
+            {
+              "id": "map-author",
+              "name": "author_name",
+              "type": "string",
+              "value": "={{$json.author_name || 'Anonymous Student'}}"
+            },
+            {
+              "id": "map-sentiment",
+              "name": "sentiment",
+              "type": "string",
+              "value": "={{$json.sentiment}}"
+            },
+            {
+              "id": "map-confidence",
+              "name": "confidence",
+              "type": "number",
+              "value": "={{$json.confidence}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "53a34cab-5e5d-407f-be82-261fce8990c8",
+      "name": "Map to Testimonial Fields",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        720,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO testimonials (feedback_id, course_id, quote, author_name, sentiment, confidence, source)\nVALUES ($1, $2, $3, $4, $5, $6, 'feedback_labels')\nON CONFLICT (feedback_id) DO NOTHING\nRETURNING id, feedback_id;",
+        "options": {
+          "queryReplacement": "={{$json.feedback_id}},{{$json.course_id}},{{$json.quote}},{{$json.author_name}},{{$json.sentiment}},{{$json.confidence}}"
+        }
+      },
+      "id": "770974f8-6ac4-4719-b4cb-7dabe30dc3e4",
+      "name": "Insert Testimonial",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        960,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "JapTUFH5W8ZdwD0T",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nreturn [{\n  json: {\n    inserted_count: items.length,\n    inserted_feedback_ids: items.map(i => i.json.feedback_id)\n  }\n}];"
+      },
+      "id": "c797704c-e719-47de-af66-2f1689dcbf52",
+      "name": "Summarize Run",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- ============================================================================\n-- testimonials_schema_and_dummy_data.sql\n--\n-- 1) Creates the `testimonials` table that the n8n workflow writes to.\n-- 2) Creates `feedback_labels` if it doesn't already exist.\n--    (Assumes `feedbacks` already exists with: feedback_id, course_id,\n--     raw_feedback, created_at, processed.)\n-- 3) Seeds dummy `feedbacks` + `feedback_labels` rows covering every branch\n--    the workflow needs to handle, for manual testing in n8n.\n-- ============================================================================\n\n-- ----------------------------------------------------------------------------\n-- 1. Target table\n-- ----------------------------------------------------------------------------\nCREATE TABLE IF NOT EXISTS testimonials (\n    id             BIGSERIAL PRIMARY KEY,\n    feedback_id    UUID NOT NULL REFERENCES feedbacks(feedback_id),\n    course_id      UUID NOT NULL,\n    quote          TEXT NOT NULL,\n    author_name    VARCHAR(150),\n    sentiment      VARCHAR(20) NOT NULL DEFAULT 'Positive',\n    confidence     FLOAT,\n    is_approved    BOOLEAN NOT NULL DEFAULT FALSE,   -- human review gate before publishing\n    source         VARCHAR(50) DEFAULT 'feedback_labels',\n    created_at     TIMESTAMP DEFAULT NOW(),\n    CONSTRAINT uq_testimonials_feedback_id UNIQUE (feedback_id)\n);\n\n-- ----------------------------------------------------------------------------\n-- 2. `feedbacks` already exists in your database with columns:\n--      feedback_id UUID, course_id UUID, raw_feedback TEXT,\n--      created_at TIMESTAMP, processed BOOLEAN\n--    so no stub is created here. `feedback_labels` is created below only if\n--    it doesn't already exist (matches the schema you originally shared).\n-- ----------------------------------------------------------------------------\nCREATE TABLE IF NOT EXISTS feedback_labels (\n    id             BIGSERIAL PRIMARY KEY,\n    feedback_id    UUID NOT NULL REFERENCES feedbacks(feedback_id),\n    course_id      UUID NOT NULL,\n    label          VARCHAR(100),\n    sentiment      VARCHAR(20),\n    severity       VARCHAR(20),\n    confidence     FLOAT,\n    owner_role     VARCHAR(50),\n    actionable     BOOLEAN,\n    created_at     TIMESTAMP DEFAULT NOW()\n);\n\n-- ----------------------------------------------------------------------------\n-- 3. Dummy data (safe to re-run: guarded with NOT EXISTS)\n--    Two courses, 8 feedbacks covering: high-confidence positive (should be\n--    inserted), low-confidence positive (should be filtered out), negative,\n--    neutral, and one positive feedback that ALREADY has a testimonial\n--    (should be skipped as a duplicate).\n-- ----------------------------------------------------------------------------\n\n-- Courses\n--   c1 = 11111111-1111-1111-1111-111111111111\n--   c2 = 22222222-2222-2222-2222-222222222222\n\nINSERT INTO feedbacks (feedback_id, course_id, raw_feedback, processed)\nSELECT * FROM (VALUES\n  ('a1111111-0000-0000-0000-000000000001'::uuid, '11111111-1111-1111-1111-111111111111'::uuid, 'This course completely changed how I think about data pipelines. The explanations were crystal clear and I finally understand joins.', true),\n  ('a1111111-0000-0000-0000-000000000002'::uuid, '11111111-1111-1111-1111-111111111111'::uuid, 'I really enjoyed the hands-on labs, they helped me apply concepts immediately.', true),\n  ('a1111111-0000-0000-0000-000000000003'::uuid, '11111111-1111-1111-1111-111111111111'::uuid, 'The pace was too fast for beginners and I felt lost during the SQL section.', true),\n  ('a1111111-0000-0000-0000-000000000004'::uuid, '22222222-2222-2222-2222-222222222222'::uuid, 'Great course overall, would recommend to any data analyst.', true),\n  ('a1111111-0000-0000-0000-000000000005'::uuid, '22222222-2222-2222-2222-222222222222'::uuid, 'Video quality was poor and audio cut out several times.', true),\n  ('a1111111-0000-0000-0000-000000000006'::uuid, '22222222-2222-2222-2222-222222222222'::uuid, 'Loved the community support in the Slack channel, made learning genuinely fun.', true),\n  ('a1111111-0000-0000-0000-000000000007'::uuid, '11111111-1111-1111-1111-111111111111'::uuid, 'It was okay, nothing special but not bad either.', true),\n  ('a1111111-0000-0000-0000-000000000008'::uuid, '22222222-2222-2222-2222-222222222222'::uuid, 'Best course I have taken all year, the projects were incredibly practical.', true)\n) AS v(feedback_id, course_id, raw_feedback, processed)\nWHERE NOT EXISTS (SELECT 1 FROM feedbacks f WHERE f.feedback_id = v.feedback_id);\n\nINSERT INTO feedback_labels (feedback_id, course_id, label, sentiment, severity, confidence, owner_role, actionable)\nSELECT * FROM (VALUES\n  ('a1111111-0000-0000-0000-000000000001'::uuid, '11111111-1111-1111-1111-111111111111'::uuid, 'clarity',       'Positive', 'low',    0.92, 'instructor', false), -- high-conf positive -> INSERT\n  ('a1111111-0000-0000-0000-000000000002'::uuid, '11111111-1111-1111-1111-111111111111'::uuid, 'hands_on',      'Positive', 'low',    0.88, 'instructor', false), -- high-conf positive -> INSERT\n  ('a1111111-0000-0000-0000-000000000003'::uuid, '11111111-1111-1111-1111-111111111111'::uuid, 'pacing',        'Negative', 'medium', 0.81, 'curriculum', true),  -- negative -> SKIP\n  ('a1111111-0000-0000-0000-000000000004'::uuid, '22222222-2222-2222-2222-222222222222'::uuid, 'general',       'Positive', 'low',    0.65, 'marketing',  false), -- positive but LOW confidence -> SKIP\n  ('a1111111-0000-0000-0000-000000000005'::uuid, '22222222-2222-2222-2222-222222222222'::uuid, 'video_quality', 'Negative', 'high',   0.90, 'engineering',true),  -- negative -> SKIP\n  ('a1111111-0000-0000-0000-000000000006'::uuid, '22222222-2222-2222-2222-222222222222'::uuid, 'community',     'Positive', 'low',    0.95, 'community',  false), -- high-conf positive -> INSERT\n  ('a1111111-0000-0000-0000-000000000007'::uuid, '11111111-1111-1111-1111-111111111111'::uuid, 'general',       'Neutral',  'low',    0.55, 'marketing',  false), -- neutral -> SKIP\n  ('a1111111-0000-0000-0000-000000000008'::uuid, '22222222-2222-2222-2222-222222222222'::uuid, 'general',       'Positive', 'low',    0.97, 'marketing',  false)  -- positive, ALREADY has testimonial -> SKIP (dup)\n) AS v(feedback_id, course_id, label, sentiment, severity, confidence, owner_role, actionable)\nWHERE NOT EXISTS (\n  SELECT 1 FROM feedback_labels fl\n  WHERE fl.feedback_id = v.feedback_id AND fl.label = v.label\n);\n\n-- Pre-seed one testimonial so the workflow's duplicate-prevention can be tested\nINSERT INTO testimonials (feedback_id, course_id, quote, author_name, sentiment, confidence, is_approved)\nSELECT 'a1111111-0000-0000-0000-000000000008'::uuid, '22222222-2222-2222-2222-222222222222'::uuid,\n       'Best course I have taken all year, the projects were incredibly practical.', NULL, 'Positive', 0.97, true\nWHERE NOT EXISTS (\n  SELECT 1 FROM testimonials WHERE feedback_id = 'a1111111-0000-0000-0000-000000000008'::uuid\n);\n\n-- ----------------------------------------------------------------------------\n-- Expected outcome after running the n8n workflow once against this seed data:\n--   Inserted (3): feedback_id ...0001, ...0002, ...0006 (all high-confidence positive)\n--   Skipped   (5): ...0003 & ...0005 (negative), ...0007 (neutral),\n--                  ...0004 (positive but confidence 0.65 < 0.70 threshold),\n--                  ...0008 (positive, but testimonial already exists)\n--\n-- Verify with:\n--   SELECT feedback_id, author_name, confidence, is_approved FROM testimonials ORDER BY created_at;\n-- ----------------------------------------------------------------------------",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        272,
+        -272
+      ],
+      "id": "bade1f2e-f031-4a7e-87d2-32104def5de2",
+      "name": "Execute a SQL query",
+      "credentials": {
+        "postgres": {
+          "id": "JapTUFH5W8ZdwD0T",
+          "name": "Postgres account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "When clicking 'Test workflow'": {
+      "main": [
+        [
+          {
+            "node": "Set Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Config": {
+      "main": [
+        [
+          {
+            "node": "Get New Positive Feedbacks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get New Positive Feedbacks": {
+      "main": [
+        [
+          {
+            "node": "Map to Testimonial Fields",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Map to Testimonial Fields": {
+      "main": [
+        [
+          {
+            "node": "Insert Testimonial",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Testimonial": {
+      "main": [
+        [
+          {
+            "node": "Summarize Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "1e09edcc-b15f-4a6d-8dc7-175089160911",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "26fec968a48127066155143f14d7974266168e9c602e171ed0edf82cc62f7dc3"
+  },
+  "nodeGroups": [],
+  "id": "2LkAnzvoip8oGlYf",
+  "tags": []
+}

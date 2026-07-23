@@ -1,0 +1,263 @@
+{
+  "name": "5 - Trend Detection (Daily)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 3 * * *"
+            }
+          ]
+        }
+      },
+      "id": "7a0208a4-440e-4966-a816-88809d8b315c",
+      "name": "Daily at 03:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "notes": "Runs after the 02:00 BERTopic clustering job finishes."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH this_week AS (\n  SELECT cluster_id, topic_name, COUNT(*) AS cnt\n  FROM feedback_clusters\n  WHERE created_at >= NOW() - INTERVAL '7 days'\n  GROUP BY cluster_id, topic_name\n),\nlast_week AS (\n  SELECT cluster_id, COUNT(*) AS cnt\n  FROM feedback_clusters\n  WHERE created_at >= NOW() - INTERVAL '14 days'\n    AND created_at < NOW() - INTERVAL '7 days'\n  GROUP BY cluster_id\n)\nSELECT\n  t.cluster_id,\n  t.topic_name,\n  COALESCE(l.cnt, 0) AS last_week_count,\n  t.cnt AS this_week_count,\n  CASE WHEN COALESCE(l.cnt, 0) = 0 THEN NULL\n       ELSE ((t.cnt - l.cnt)::float / l.cnt) * 100\n  END AS growth_pct\nFROM this_week t\nLEFT JOIN last_week l ON l.cluster_id = t.cluster_id\nORDER BY growth_pct DESC NULLS FIRST;",
+        "options": {}
+      },
+      "id": "2235aebc-d59f-4dbf-9fdc-9bd57402dfe9",
+      "name": "Compare Cluster Sizes WoW",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        220,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "1",
+          "name": "Feedback DB (Postgres)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.growth_pct }}",
+              "rightValue": 40,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            },
+            {
+              "leftValue": "={{ $json.this_week_count }}",
+              "rightValue": 10,
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "fb9451b2-f09c-42d2-830d-da80fcf6aa53",
+      "name": "Filter Significant Growth",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [
+        440,
+        0
+      ],
+      "notes": "Growth threshold (40%) mirrors the +42% WoW example in the design doc; the minimum-count guard avoids flagging tiny clusters where a jump from 2->3 feedbacks looks dramatic."
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "return items.map(item => {\n  const c = item.json;\n  return {\n    json: {\n      role: 'Course Lead',\n      severity: c.growth_pct > 100 ? 'Critical' : 'High',\n      message: `Emerging issue: \\\"${c.topic_name}\\\" grew from ${c.last_week_count} to ${c.this_week_count} ` +\n               `feedbacks this week (+${c.growth_pct.toFixed(0)}% WoW).`\n    }\n  };\n});"
+      },
+      "id": "8d987d51-c27e-42c3-8761-36bdc737950e",
+      "name": "Format Emerging Issue Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO alerts (role, severity, message, created_at)\nVALUES ($1, $2, $3, NOW());",
+        "options": {
+          "queryReplacement": "={{ $json.role }},{{ $json.severity }},{{ $json.message }}"
+        }
+      },
+      "id": "74d9a4c8-ffe6-4856-919e-fe042d24a2d7",
+      "name": "Insert Emerging Alert",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        880,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "1",
+          "name": "Feedback DB (Postgres)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "select": "channel",
+        "channelId": {
+          "mode": "name",
+          "value": "#feedback-alerts"
+        },
+        "text": "={{ ':chart_with_upwards_trend: [' + $json.severity + '] ' + $json.message }}"
+      },
+      "id": "7cb06ec0-5dc4-4294-acdb-7d1720c6c202",
+      "name": "Notify Course Leads",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        1100,
+        0
+      ],
+      "credentials": {
+        "slackApi": {
+          "id": "3",
+          "name": "Ops Slack"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "e6758462-4bc4-4cd2-b938-704df99526cd",
+      "name": "Manual Trigger (Test)",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        260
+      ],
+      "notes": "Click to test the growth filter, alert formatting, and Postgres write / Slack notification without waiting for the daily schedule."
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "// Mock rows shaped like \"Compare Cluster Sizes WoW\" (Postgres) output:\n// cluster_id, topic_name, last_week_count, this_week_count, growth_pct\n// Mix of rows that should and shouldn't pass \"Filter Significant Growth\"\n// (> 40% growth AND >= 10 this-week count).\nreturn [\n  { json: { cluster_id: 12, topic_name: 'Assignment deadline complaints', last_week_count: 18, this_week_count: 31, growth_pct: 72.2 } },   // passes -> High\n  { json: { cluster_id: 3, topic_name: 'Certificate download bug', last_week_count: 5, this_week_count: 12, growth_pct: 140 } },             // passes -> Critical (>100%)\n  { json: { cluster_id: 7, topic_name: 'Video playback issues', last_week_count: 40, this_week_count: 44, growth_pct: 10 } },                // fails: growth too low\n  { json: { cluster_id: 19, topic_name: 'New TA onboarding confusion', last_week_count: 2, this_week_count: 5, growth_pct: 150 } }            // fails: below min-count guard\n];"
+      },
+      "id": "526ad430-3aed-4b3a-8bbf-2dbf10946b37",
+      "name": "Mock Cluster WoW Comparison",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        260
+      ],
+      "notes": "Stands in for 'Compare Cluster Sizes WoW'. Includes rows that should pass the filter (one High, one Critical severity) and rows that shouldn't (low growth; below minimum count guard)."
+    }
+  ],
+  "connections": {
+    "Daily at 03:00": {
+      "main": [
+        [
+          {
+            "node": "Compare Cluster Sizes WoW",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compare Cluster Sizes WoW": {
+      "main": [
+        [
+          {
+            "node": "Filter Significant Growth",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter Significant Growth": {
+      "main": [
+        [
+          {
+            "node": "Format Emerging Issue Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Emerging Issue Alert": {
+      "main": [
+        [
+          {
+            "node": "Insert Emerging Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Emerging Alert": {
+      "main": [
+        [
+          {
+            "node": "Notify Course Leads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Trigger (Test)": {
+      "main": [
+        [
+          {
+            "node": "Mock Cluster WoW Comparison",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mock Cluster WoW Comparison": {
+      "main": [
+        [
+          {
+            "node": "Filter Significant Growth",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "instanceId": "feedback-pipeline-template"
+  }
+}

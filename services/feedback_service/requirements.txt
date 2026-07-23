@@ -1,15 +1,18 @@
 fastapi>=0.111
 uvicorn[standard]>=0.30
-pydantic>=2.7
 pydantic-settings>=2.3
 langdetect>=1.0.9
 deep-translator>=1.11.4
-langchain>=0.2
-langchain-openai>=0.1
-langchain-google-genai>=1.0
 python-dotenv>=1.0
+
+# Pinned to no specific version, matching the notebook's own
+# `!pip install langchain / langchain-openai / langchain-google-genai / pydantic`
+langchain
+langchain-openai
+langchain-google-genai
+pydantic
 
 # Optional (used only for NER-based PII redaction in app/preprocessing.py).
 # Install and run `python -m spacy download en_core_web_sm` to enable it;
 # the service works fine without it (falls back to regex-only PII redaction).
-# spacy>=3.7
+spacy>=3.7

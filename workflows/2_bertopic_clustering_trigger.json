@@ -1,0 +1,295 @@
+{
+  "name": "2 - BERTopic Clustering Trigger",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 2 * * *"
+            }
+          ]
+        }
+      },
+      "id": "ba418280-9a4c-45ab-82e0-fe77e2b2efba",
+      "name": "Daily at 02:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.BERTOPIC_SERVICE_URL }}/cluster-feedback",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ days: 30 }) }}",
+        "options": {
+          "timeout": 600000
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        }
+      },
+      "id": "2b4c9ee7-ea59-4e1c-909a-973ed68e723b",
+      "name": "Trigger BERTopic Clustering",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        220,
+        0
+      ],
+      "notes": "Python/FastAPI service owns the embeddings -> UMAP -> HDBSCAN -> BERTopic pipeline and writes directly to feedback_clusters. n8n only kicks it off and checks the result."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "ok",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "d92b08a5-d579-4abf-9a16-832b9d2621ab",
+      "name": "Clustering Succeeded?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        440,
+        0
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "9ead6314-2459-481a-87f5-fcc0d24c5a60",
+      "name": "No Op (Success)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        660,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "return [{ json: {\n  text: `:warning: BERTopic clustering job failed at ${new Date().toISOString()}. ` +\n         `Response: ${JSON.stringify($input.first().json).slice(0, 500)}`\n} }];"
+      },
+      "id": "c78752c6-f3e9-481d-b595-fde83bb63097",
+      "name": "Format Failure Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "select": "channel",
+        "channelId": {
+          "mode": "name",
+          "value": "#feedback-pipeline-ops"
+        },
+        "text": "={{ $json.text }}"
+      },
+      "id": "280d9a45-7406-4057-8cc2-91900b3d89eb",
+      "name": "Notify Ops Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        880,
+        120
+      ],
+      "credentials": {
+        "slackApi": {
+          "id": "3",
+          "name": "Ops Slack"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "a6eeaa90-9cf0-461a-b1ff-3287581ccb17",
+      "name": "Manual Trigger - Success Case",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        260
+      ],
+      "notes": "Click to test the success path without calling the real BERTopic service."
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "// Mock success response shaped like the BERTopic service's /cluster-feedback reply.\nreturn [{ json: {\n  status: \"ok\",\n  n_clusters: 14,\n  n_documents: 1523,\n  silhouette_score: 0.42,\n  duration_seconds: 187\n} }];"
+      },
+      "id": "0361324f-2a1a-46b4-aab9-b1533a61ade4",
+      "name": "Mock: Clustering Succeeded",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        260
+      ],
+      "notes": "Stands in for a successful 'Trigger BERTopic Clustering' response."
+    },
+    {
+      "parameters": {},
+      "id": "43567550-88cf-4ac0-9784-ed889bfc12c0",
+      "name": "Manual Trigger - Failure Case",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        420
+      ],
+      "notes": "Click to test the failure/alerting path (Format Failure Alert -> Notify Ops Slack) without the BERTopic service actually needing to fail."
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "// Mock failure response \u2014 use this to test the alert/Slack branch\n// without needing the BERTopic service to actually fail.\nreturn [{ json: {\n  status: \"error\",\n  n_clusters: 0,\n  n_documents: 812,\n  error: \"UMAP failed: n_neighbors=15 must be less than n_samples=12 after filtering low-signal feedback\"\n} }];"
+      },
+      "id": "bf240879-f4ed-42e0-8121-66134b050839",
+      "name": "Mock: Clustering Failed",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        420
+      ],
+      "notes": "Stands in for a failed 'Trigger BERTopic Clustering' response."
+    }
+  ],
+  "connections": {
+    "Daily at 02:00": {
+      "main": [
+        [
+          {
+            "node": "Trigger BERTopic Clustering",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Trigger BERTopic Clustering": {
+      "main": [
+        [
+          {
+            "node": "Clustering Succeeded?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clustering Succeeded?": {
+      "main": [
+        [
+          {
+            "node": "No Op (Success)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Format Failure Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Failure Alert": {
+      "main": [
+        [
+          {
+            "node": "Notify Ops Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Trigger - Success Case": {
+      "main": [
+        [
+          {
+            "node": "Mock: Clustering Succeeded",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mock: Clustering Succeeded": {
+      "main": [
+        [
+          {
+            "node": "Clustering Succeeded?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Trigger - Failure Case": {
+      "main": [
+        [
+          {
+            "node": "Mock: Clustering Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mock: Clustering Failed": {
+      "main": [
+        [
+          {
+            "node": "Clustering Succeeded?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "instanceId": "feedback-pipeline-template"
+  }
+}

@@ -1,0 +1,673 @@
+{
+  "name": "1 - Feedback Processing Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes"
+            }
+          ]
+        }
+      },
+      "id": "f7db957d-3243-4e04-a61c-4e7493f2835f",
+      "name": "Every 5 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -240,
+        368
+      ],
+      "disabled": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT feedback_id, course_id, raw_feedback, created_at\nFROM feedbacks\nWHERE processed = FALSE\nORDER BY created_at ASC\nLIMIT 500;",
+        "options": {}
+      },
+      "id": "e2cb25e9-a1f0-4f32-812c-237f2115a3c2",
+      "name": "Fetch Unprocessed Feedback",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -32,
+        368
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "JapTUFH5W8ZdwD0T",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Basic deterministic cleanup before the LLM call.\n// - trims whitespace\n// - masks obvious PII (emails, phone numbers)\n// - flags likely spam / gibberish so the LLM prompt can be skipped/short-circuited later\n\nconst emailRe = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}/g;\nconst phoneRe = /\\+?\\d[\\d\\-\\s()]{7,}\\d/g;\n\nfunction looksLikeGibberish(text) {\n  const letters = (text.match(/[a-zA-Z]/g) || []).length;\n  return text.length > 0 && letters / text.length < 0.3;\n}\n\nreturn items.map(item => {\n  const raw = (item.json.raw_feedback || '').toString().trim();\n  const clean = raw.replace(emailRe, '[EMAIL]').replace(phoneRe, '[PHONE]');\n  return {\n    json: {\n      ...item.json,\n      clean_feedback: clean,\n      is_spam_candidate: clean.length < 3,\n      is_gibberish_candidate: looksLikeGibberish(clean)\n    }\n  };\n});"
+      },
+      "id": "383cc956-6c0c-4616-bac4-854bd1053654",
+      "name": "Preprocess & Strip PII",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        464,
+        576
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  model: \"claude-sonnet-4-6\",\n  max_tokens: 1000,\n  system: \"You classify course feedback. If the feedback is not in English, translate it first. \" +\n          \"Return ONLY valid JSON, no prose, matching this schema: \" +\n          '{\"actionable\": boolean, \"summary\": string, \"labels\": [{\"label\": string, \"sentiment\": \"positive|neutral|negative\", \"severity\": \"low|medium|high|critical\", \"confidence\": number}]}' +\n          \" Valid label prefixes are Content|, Tutor|, Tech|, Admin|. Use multiple labels when feedback covers multiple topics.\",\n  messages: [{ role: \"user\", content: $json.clean_feedback }]\n}) }}",
+        "options": {}
+      },
+      "id": "16ba5e23-041f-49bd-8c4d-fb30e24b82df",
+      "name": "LLM Classification",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1040,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract the classification from either:\n//  (a) the raw Anthropic Messages API response (`LLM Classification` node),\n//      where the JSON classification is embedded as a string in\n//      content[0].text, or\n//  (b) the feedback-service response (`HTTP Request1` -> POST\n//      /classify-feedback), which already returns a structured\n//      `classification` object.\n// Then compute the MINIMUM label confidence (not average) so one uncertain\n// label forces the whole feedback into human review.\n//\n// feedback_id / course_id / raw_feedback are pulled from `Edit Fields`\n// (the shared node before the preprocessing/classification branches) via\n// item-linking, since neither response body above carries those fields\n// through on its own.\n\nreturn items.map((item, i) => {\n  const res = item.json;\n  let parsed;\n  let rawLlmResponse = '';\n  let llmModel = 'claude-sonnet-4-6';\n\n  if (res.content?.[0]?.text) {\n    // (a) Raw Anthropic API response\n    rawLlmResponse = res.content[0].text;\n    llmModel = res.model || llmModel;\n    try {\n      parsed = JSON.parse(rawLlmResponse);\n    } catch (e) {\n      parsed = { actionable: false, summary: '', labels: [] };\n    }\n  } else if (res.classification) {\n    // (b) feedback-service /classify-feedback response\n    parsed = res.classification;\n    rawLlmResponse = JSON.stringify(res.classification);\n    llmModel = 'feedback-service';\n  } else {\n    parsed = { actionable: false, summary: '', labels: [] };\n  }\n\n  const confidences = (parsed.labels || []).map(l => l.confidence ?? 0);\n  const minConfidence = confidences.length ? Math.min(...confidences) : 0;\n\n  const source = $('Edit Fields').itemMatching(i).json;\n\n  return {\n    json: {\n      feedback_id: source.feedback_id,\n      course_id: source.course_id,\n      actionable: parsed.actionable ?? false,\n      summary: parsed.summary || '',\n      labels: parsed.labels || [],\n      llm_model: llmModel,\n      min_confidence: minConfidence,\n      review_required: minConfidence < 0.70,\n      raw_llm_response: rawLlmResponse,\n      raw_feedback: source.raw_feedback\n    }\n  };\n});"
+      },
+      "id": "f8a10864-5404-437a-8078-fad1c45510b7",
+      "name": "Parse LLM Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1184,
+        336
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.min_confidence }}",
+              "rightValue": 0.7,
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              },
+              "id": "d027092d-a1b6-4fb8-9008-5fe2247a0f5e"
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a1546917-bc61-4274-bbd0-701dd5db3c74",
+      "name": "Confidence >= 0.70?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1408,
+        336
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// One n8n item per LABEL (feedback_labels is one row per label).\nconst OWNER_MAP = {\n  Content: 'Course Lead',\n  Tutor: 'Course Lead',\n  Tech: 'QA Lead',\n  Admin: 'Operations Lead'\n};\n\nconst out = [];\nfor (const item of items) {\n  const f = item.json;\n  for (const label of (f.labels || [])) {\n    const prefix = (label.label || '').split('|')[0];\n    out.push({\n      json: {\n        feedback_id: f.feedback_id,\n        course_id: f.course_id,\n        label: label.label,\n        sentiment: label.sentiment,\n        severity: label.severity,\n        confidence: label.confidence,\n        owner_role: OWNER_MAP[prefix] || 'Course Lead',\n        actionable: f.actionable\n      }\n    });\n  }\n}\nreturn out;"
+      },
+      "id": "128c069f-3210-4308-a1be-46cf6dd91af6",
+      "name": "Assign Owners & Expand Labels",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1616,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO feedback_labels\n  (feedback_id, course_id, label, sentiment, severity, confidence, owner_role, actionable, created_at)\nVALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW());",
+        "options": {
+          "queryReplacement": "={{ $json.feedback_id }},{{ $json.course_id }},{{ $json.label }},{{ $json.sentiment }},{{ $json.severity }},{{ $json.confidence }},{{ $json.owner_role }},{{ $json.actionable }}"
+        }
+      },
+      "id": "58a950ab-742e-452e-93f3-ac92c817e770",
+      "name": "Insert Feedback Label",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1792,
+        240
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "JapTUFH5W8ZdwD0T",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE feedbacks SET processed = TRUE WHERE feedback_id = $1;",
+        "options": {
+          "queryReplacement": "={{ $json.feedback_id }}"
+        }
+      },
+      "id": "7d18ad1c-59cc-4dac-bf80-6ec737b4f23f",
+      "name": "Mark Feedback Processed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1632,
+        448
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "JapTUFH5W8ZdwD0T",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO review_queue (feedback_id, raw_feedback, llm_response, reason, status, created_at)\nVALUES ($1, $2, $3, $4, 'pending', NOW());",
+        "options": {
+          "queryReplacement": "={{ $json.feedback_id }},{{ $json.raw_feedback }},{{ JSON.stringify({actionable: $json.actionable, summary: $json.summary, labels: $json.labels}) }},{{ 'min label confidence ' + $json.min_confidence.toFixed(2) + ' below 0.70 threshold' }}"
+        }
+      },
+      "id": "43e9f0c8-f835-4e6c-b35d-7137db9daf4a",
+      "name": "Insert Review Queue Entry",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1632,
+        672
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "JapTUFH5W8ZdwD0T",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE feedbacks SET processed = TRUE WHERE feedback_id = $1;",
+        "options": {
+          "queryReplacement": "={{ $json.feedback_id }}"
+        }
+      },
+      "id": "b2e5e748-d423-4b71-a561-d9cf6fe8a758",
+      "name": "Mark Feedback Processed (Queued)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1856,
+        672
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "JapTUFH5W8ZdwD0T",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "6ddeda36-8512-4a46-9a13-e3eb137ba9b8",
+      "name": "Manual Trigger (Test)",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -256,
+        624
+      ],
+      "notes": "Click to run the pipeline on demand with mock rows instead of waiting for the 5-minute schedule / a live Postgres fetch. Downstream LLM Classification still calls the real Anthropic API."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Mock rows shaped exactly like \"Fetch Unprocessed Feedback\" (Postgres) output:\n// feedback_id, course_id, raw_feedback, created_at\n// Covers: a clear actionable tech complaint, a mixed sentiment/multi-topic\n// piece, likely gibberish/spam, and PII that should get masked downstream.\nreturn [\n  { json: {\n    feedback_id: 9001,\n    course_id: 'CS101',\n    raw_feedback: \"The video lectures for Module 3 keep freezing around the 10 minute mark on Chrome. Really frustrating, please fix ASAP.\",\n    created_at: new Date(Date.now() - 3 * 60 * 1000).toISOString()\n  }},\n  { json: {\n    feedback_id: 9002,\n    course_id: 'CS101',\n    raw_feedback: \"Our TA Priya is amazing, always responds fast on Slack, but the assignment deadlines feel too tight for working students.\",\n    created_at: new Date(Date.now() - 7 * 60 * 1000).toISOString()\n  }},\n  { json: {\n    feedback_id: 9003,\n    course_id: 'BIO220',\n    raw_feedback: \"asdkj alksd aslkdj q23 zzxx\",\n    created_at: new Date(Date.now() - 12 * 60 * 1000).toISOString()\n  }},\n  { json: {\n    feedback_id: 9004,\n    course_id: 'MATH150',\n    raw_feedback: \"Great course overall! You can reach me at jane.doe@example.com or call +1 415-555-0192 if you want more detailed feedback.\",\n    created_at: new Date(Date.now() - 20 * 60 * 1000).toISOString()\n  }}\n];"
+      },
+      "id": "833c4645-efb2-4478-a760-82ce9e0392a3",
+      "name": "Mock Unprocessed Feedback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -32,
+        624
+      ],
+      "notes": "Stands in for 'Fetch Unprocessed Feedback'. Includes a clear tech complaint, a mixed-sentiment multi-topic item, likely gibberish, and text with PII to exercise masking."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- =====================================================================\n-- Feedback Pipeline schema\n-- Run this once before activating the n8n workflows.\n-- =====================================================================\n\nCREATE TABLE IF NOT EXISTS feedbacks (\n    feedback_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),\n    course_id UUID NOT NULL,\n    raw_feedback TEXT NOT NULL,\n    created_at TIMESTAMP DEFAULT NOW(),\n    processed BOOLEAN DEFAULT FALSE\n);\nCREATE INDEX IF NOT EXISTS idx_feedbacks_unprocessed ON feedbacks (processed) WHERE processed = FALSE;\n\nCREATE TABLE IF NOT EXISTS feedback_classifications (\n    id BIGSERIAL PRIMARY KEY,\n    feedback_id UUID NOT NULL REFERENCES feedbacks(feedback_id),\n    course_id UUID NOT NULL,\n    actionable BOOLEAN,\n    summary TEXT,\n    llm_model TEXT,\n    classification_confidence FLOAT,\n    review_required BOOLEAN,\n    created_at TIMESTAMP DEFAULT NOW()\n);\n\n-- Main fact table: one row per LABEL, not per feedback.\nCREATE TABLE IF NOT EXISTS feedback_labels (\n    id BIGSERIAL PRIMARY KEY,\n    feedback_id UUID NOT NULL REFERENCES feedbacks(feedback_id),\n    course_id UUID NOT NULL,\n    label VARCHAR(100),\n    sentiment VARCHAR(20),\n    severity VARCHAR(20),\n    confidence FLOAT,\n    owner_role VARCHAR(50),\n    actionable BOOLEAN,\n    created_at TIMESTAMP DEFAULT NOW()\n);\nCREATE INDEX IF NOT EXISTS idx_feedback_labels_label ON feedback_labels (label);\nCREATE INDEX IF NOT EXISTS idx_feedback_labels_created_at ON feedback_labels (created_at);\n\nCREATE TABLE IF NOT EXISTS review_queue (\n    id BIGSERIAL PRIMARY KEY,\n    feedback_id UUID,\n    raw_feedback TEXT,\n    llm_response JSONB,\n    reason TEXT,\n    status TEXT DEFAULT 'pending',\n    created_at TIMESTAMP DEFAULT NOW()\n);\n\nCREATE TABLE IF NOT EXISTS feedback_clusters (\n    id BIGSERIAL PRIMARY KEY,\n    feedback_id UUID,\n    cluster_id VARCHAR(100),\n    topic_name TEXT,\n    probability FLOAT,\n    created_at TIMESTAMP DEFAULT NOW()\n);\nCREATE INDEX IF NOT EXISTS idx_feedback_clusters_created_at ON feedback_clusters (created_at);\nCREATE INDEX IF NOT EXISTS idx_feedback_clusters_cluster_id ON feedback_clusters (cluster_id);\n\nCREATE TABLE IF NOT EXISTS kpi_snapshots (\n    id BIGSERIAL PRIMARY KEY,\n    snapshot_date DATE,\n    role VARCHAR(50),\n    kpi_name VARCHAR(100),\n    value FLOAT,\n    threshold FLOAT,\n    status VARCHAR(20)\n);\nCREATE INDEX IF NOT EXISTS idx_kpi_snapshots_date ON kpi_snapshots (snapshot_date);\n\n-- Referenced by Workflow 4 (Alert Engine) and Workflow 5 (Trend Detection)\n-- but not defined in the original design doc -- added here so both workflows run as-is.\nCREATE TABLE IF NOT EXISTS alerts (\n    id BIGSERIAL PRIMARY KEY,\n    role VARCHAR(50),\n    severity VARCHAR(20),\n    message TEXT,\n    kpi_snapshot_id BIGINT REFERENCES kpi_snapshots(id), -- set for KPI-threshold alerts, NULL for trend/emerging-issue alerts\n    created_at TIMESTAMP DEFAULT NOW()\n);\nCREATE INDEX IF NOT EXISTS idx_alerts_kpi_snapshot ON alerts (kpi_snapshot_id);\n\nCREATE TABLE IF NOT EXISTS testimonials (\n    id             BIGSERIAL PRIMARY KEY,\n    feedback_id    UUID NOT NULL REFERENCES feedbacks(feedback_id),\n    course_id      UUID NOT NULL,\n    quote          TEXT NOT NULL,\n    author_name    VARCHAR(150),\n    sentiment      VARCHAR(20) NOT NULL DEFAULT 'Positive',\n    confidence     FLOAT,\n    is_approved    BOOLEAN NOT NULL DEFAULT FALSE,   -- human review gate before publishing\n    source         VARCHAR(50) DEFAULT 'feedback_labels',\n    created_at     TIMESTAMP DEFAULT NOW(),\n    CONSTRAINT uq_testimonials_feedback_id UNIQUE (feedback_id)\n);\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        0,
+        16
+      ],
+      "id": "520c1f72-9006-423e-93f5-36edf3f05156",
+      "name": "Init DB Tables",
+      "credentials": {
+        "postgres": {
+          "id": "JapTUFH5W8ZdwD0T",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://feedback-service:8000/preprocess",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  text: $json.raw_feedback,\n  translate: true,\n  remove_pii: true,\n  remove_duplicates: true\n}) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        464,
+        352
+      ],
+      "id": "ac4113bc-d42f-4e27-be38-9e288b2b7536",
+      "name": "HTTP Request"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "75457a51-43ba-4764-b598-5dc67a54c9a5",
+              "name": "ALLOW_EXT_PREPROCESSING",
+              "value": true,
+              "type": "boolean"
+            },
+            {
+              "id": "13076074-a3fb-4230-b161-bbb0816bde79",
+              "name": "ALLOW_EXT_CLASSIFICATION",
+              "value": true,
+              "type": "boolean"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        128,
+        368
+      ],
+      "id": "043e2d3f-d811-43c8-bb29-73ab2b4de70c",
+      "name": "Edit Fields"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://feedback-service:8000/classify-feedback",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  text: $json.final_text || $json.clean_feedback || $json.raw_feedback,\n  provider: \"gemini\",\n  preprocess: false\n}) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        1040,
+        336
+      ],
+      "id": "11e461a4-5741-49ac-a6ed-957f3c3263c5",
+      "name": "HTTP Request1"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "4f29cc9b-617d-417a-83b9-8cf6a595da24",
+              "leftValue": "={{ $('Edit Fields').item.json.ALLOW_EXT_PREPROCESSING}}",
+              "rightValue": "True",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        288,
+        368
+      ],
+      "id": "08e06ebf-95ce-488f-9cb7-b23e028059b9",
+      "name": "External Preprocessing"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "d0b4cdc6-cc30-4a05-bac4-2ec3c8006d8b",
+              "leftValue": "={{ $('Edit Fields').item.json.ALLOW_EXT_CLASSIFICATION}}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        832,
+        352
+      ],
+      "id": "22999f13-aa19-48fb-906e-17fdde0cf888",
+      "name": "External Classification"
+    },
+    {
+      "parameters": {
+        "jsCode": "const _items = [];\n\nfor (const item of $input.all()) {\n  if (item.json.final_text != \"\"){\n    _items.push(item)\n  }\n}\n\nreturn _items;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        656,
+        352
+      ],
+      "id": "3537fc91-56bf-458c-a1b8-f381850bfbce",
+      "name": "Code in JavaScript"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Every 5 Minutes": {
+      "main": [
+        [
+          {
+            "node": "Fetch Unprocessed Feedback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Unprocessed Feedback": {
+      "main": [
+        [
+          {
+            "node": "Edit Fields",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preprocess & Strip PII": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM Classification": {
+      "main": [
+        [
+          {
+            "node": "Parse LLM Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse LLM Response": {
+      "main": [
+        [
+          {
+            "node": "Confidence >= 0.70?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Confidence >= 0.70?": {
+      "main": [
+        [
+          {
+            "node": "Assign Owners & Expand Labels",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Mark Feedback Processed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Insert Review Queue Entry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assign Owners & Expand Labels": {
+      "main": [
+        [
+          {
+            "node": "Insert Feedback Label",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Review Queue Entry": {
+      "main": [
+        [
+          {
+            "node": "Mark Feedback Processed (Queued)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Trigger (Test)": {
+      "main": [
+        [
+          {
+            "node": "Mock Unprocessed Feedback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mock Unprocessed Feedback": {
+      "main": [
+        [
+          {
+            "node": "Edit Fields",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Edit Fields": {
+      "main": [
+        [
+          {
+            "node": "External Preprocessing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request1": {
+      "main": [
+        [
+          {
+            "node": "Parse LLM Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "External Preprocessing": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Preprocess & Strip PII",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "External Classification": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "LLM Classification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "External Classification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "ffebadec-d7be-497a-a4eb-2fdc723f05c3",
+  "meta": {
+    "instanceId": "26fec968a48127066155143f14d7974266168e9c602e171ed0edf82cc62f7dc3"
+  },
+  "nodeGroups": [],
+  "id": "QDLYOBFi2sXxLrdX",
+  "tags": []
+}

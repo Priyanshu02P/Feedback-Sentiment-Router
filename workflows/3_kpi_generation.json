@@ -1,0 +1,175 @@
+{
+  "name": "3 - KPI Generation (Nightly)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 1 * * *"
+            }
+          ]
+        }
+      },
+      "id": "71869c31-c891-4643-84ca-f4556971e445",
+      "name": "Nightly at 01:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH window AS (\n  SELECT * FROM feedback_labels\n  WHERE created_at >= NOW() - INTERVAL '1 day'\n)\nSELECT 'tutor_complaint_rate' AS kpi_name, 'Course Lead' AS role,\n  COUNT(*) FILTER (WHERE label LIKE 'Tutor%' AND sentiment = 'negative')::float\n  / NULLIF(COUNT(*) FILTER (WHERE label LIKE 'Tutor%'), 0) AS value\nFROM window\n\nUNION ALL\n\nSELECT 'ux_complaint_rate', 'QA Lead',\n  COUNT(*) FILTER (WHERE label = 'Tech|UX' AND sentiment = 'negative')::float\n  / NULLIF(COUNT(*) FILTER (WHERE label = 'Tech|UX'), 0)\nFROM window\n\nUNION ALL\n\nSELECT 'high_severity_tutor_rate', 'Course Lead',\n  COUNT(*) FILTER (WHERE label LIKE 'Tutor%' AND severity IN ('high','critical'))::float\n  / NULLIF(COUNT(*) FILTER (WHERE label LIKE 'Tutor%'), 0)\nFROM window;",
+        "options": {}
+      },
+      "id": "75ab3b09-a24e-4806-bc2f-6ababff4e9d2",
+      "name": "Calculate KPIs",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        220,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "1",
+          "name": "Feedback DB (Postgres)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "// Thresholds live here so they can be tuned without touching SQL.\nconst THRESHOLDS = {\n  tutor_complaint_rate: 0.15,\n  ux_complaint_rate: 0.15,\n  high_severity_tutor_rate: 0.10\n};\n\nreturn items.map(item => {\n  const value = item.json.value ?? 0;\n  const threshold = THRESHOLDS[item.json.kpi_name] ?? 1;\n  const status = value > threshold ? 'breach' : (value > threshold * 0.8 ? 'warning' : 'ok');\n  return {\n    json: {\n      snapshot_date: new Date().toISOString().slice(0, 10),\n      role: item.json.role,\n      kpi_name: item.json.kpi_name,\n      value,\n      threshold,\n      status\n    }\n  };\n});"
+      },
+      "id": "e9319184-c61f-459e-963a-61e6dfd72d98",
+      "name": "Add Thresholds & Status",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO kpi_snapshots (snapshot_date, role, kpi_name, value, threshold, status)\nVALUES ($1, $2, $3, $4, $5, $6);",
+        "options": {
+          "queryReplacement": "={{ $json.snapshot_date }},{{ $json.role }},{{ $json.kpi_name }},{{ $json.value }},{{ $json.threshold }},{{ $json.status }}"
+        }
+      },
+      "id": "1b7c6c9b-3d8f-4559-a5a3-6851561a1a3e",
+      "name": "Insert KPI Snapshot",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        660,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "1",
+          "name": "Feedback DB (Postgres)"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "7b612b6d-8611-4292-bfe9-f8af378d5da0",
+      "name": "Manual Trigger (Test)",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        260
+      ],
+      "notes": "Click to test threshold/status logic and the Postgres write without waiting for the nightly schedule."
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "// Mock rows shaped like \"Calculate KPIs\" (Postgres UNION ALL) output:\n// kpi_name, role, value\n// Covers a breach, an ok, and a warning-band result across the three KPIs.\nreturn [\n  { json: { kpi_name: 'tutor_complaint_rate', role: 'Course Lead', value: 0.22 } },      // breach (> 0.15)\n  { json: { kpi_name: 'ux_complaint_rate', role: 'QA Lead', value: 0.05 } },              // ok (< 0.12)\n  { json: { kpi_name: 'high_severity_tutor_rate', role: 'Course Lead', value: 0.085 } }   // warning (0.08 < x <= 0.10)\n];"
+      },
+      "id": "084036f5-a091-44cf-af9b-8fed165a1030",
+      "name": "Mock KPI Query Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        260
+      ],
+      "notes": "Stands in for 'Calculate KPIs'. Deliberately includes one breach, one ok, and one warning-band value so all three statuses get exercised."
+    }
+  ],
+  "connections": {
+    "Nightly at 01:00": {
+      "main": [
+        [
+          {
+            "node": "Calculate KPIs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate KPIs": {
+      "main": [
+        [
+          {
+            "node": "Add Thresholds & Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Add Thresholds & Status": {
+      "main": [
+        [
+          {
+            "node": "Insert KPI Snapshot",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Trigger (Test)": {
+      "main": [
+        [
+          {
+            "node": "Mock KPI Query Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mock KPI Query Results": {
+      "main": [
+        [
+          {
+            "node": "Add Thresholds & Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "instanceId": "feedback-pipeline-template"
+  }
+}

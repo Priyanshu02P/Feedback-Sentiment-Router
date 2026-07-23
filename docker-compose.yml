@@ -7,6 +7,9 @@ services:
       POSTGRES_USER: n8n
       POSTGRES_PASSWORD: n8n_password
       POSTGRES_DB: n8n
+      BERTOPIC_SERVICE_URL: http://bertopic-service:8000
+      FEEDBACK_SERVICE_URL: http://feedback-service:8000
+
     volumes:
       - postgres_data:/var/lib/postgresql/data
       # creates the separate `feedback` database + schema on first boot
@@ -42,14 +45,14 @@ services:
 
   # Preprocessing + LLM classification API: POST /preprocess, POST /classify-feedback
   feedback-service:
-    build: .services/feedback_service
+    build: services/feedback_service
     container_name: feedback-service
     restart: unless-stopped
     ports:
       - "8001:8000"
     environment:
-      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
-      GOOGLE_API_KEY: "${GOOGLE_API_KEY:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY}"
+      GOOGLE_API_KEY: "${GOOGLE_APL_KEY}"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 15s
@@ -58,7 +61,7 @@ services:
 
   # BERTopic clustering API, called by n8n Workflow 2: POST /cluster-feedback
   bertopic-service:
-    build: .services/bertopic_service
+    build: services/bertopic_service
     container_name: bertopic-service
     restart: unless-stopped
     ports:
